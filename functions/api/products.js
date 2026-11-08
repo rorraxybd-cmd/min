@@ -22,7 +22,7 @@ export async function onRequest(context) {
   try {
     const url = new URL(request.url);
     
-    // 1. GET Request (উন্নত ও নমনীয় ফিল্টারিং যাতে কোনো প্রোডাক্ট মিস না হয়)
+    // 1. GET Request
     if (request.method === "GET") {
       const productCode = url.searchParams.get("code") || url.searchParams.get("id");
       const sellerId = url.searchParams.get("seller_id");
@@ -41,7 +41,6 @@ export async function onRequest(context) {
         params.push(sellerId);
       }
       
-      // মোড ফিল্টারটি যদি একান্তই দেওয়া হয়, তবে যেন wholesale, both বা ফাঁকা সব রিলায়েবল ডাটা নিয়ে আসে
       if (mode && mode.toLowerCase() !== 'all') {
         const cleanMode = mode.toLowerCase().trim();
         if (cleanMode === 'wholesale') {
@@ -164,4 +163,4 @@ export async function onRequest(context) {
       headers: { ...corsHeaders, "Content-Type": "application/json" }
     });
   }
-}
+}[cite: 8]
