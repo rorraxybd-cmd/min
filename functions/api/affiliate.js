@@ -16,115 +16,190 @@ export async function onRequest(context) {
     const action = url.searchParams.get("action");
 
     // ==========================================
-    // ১. ভেরিফিকেশন রিকোয়েস্ট (সরাসরি affiliate_info টেবিলে সেভ হবে)
+    // ১. ম্যাজিক লিংক ও আইপি ভেরিফিকেশন (Send Magic Code & IP Security)
     // ==========================================
-    if (action === "send-magic-link" || action === "verify") {
+    if (action === "send_magic_link" || action === "verify") {
       if (request.method !== "POST") {
-        return new Response(JSON.stringify({ success: false, error: "Method not allowed" }), { status: 405, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+        return new Response(JSON.stringify({ success: false, error: "Method not allowed" }), { 
+          status: 405, 
+          headers: { ...corsHeaders, "Content-Type": "application/json" } 
+        });
       }
 
       const body = await request.json();
-      const email = (body.email || "").toLowerCase();
-      if (!email) {
-        return new Response(JSON.stringify({ success: false, error: "Email required" }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      const email = (body.email || "").toLowerCase().trim();
+      const countryCode = body.country_code || "+880";
+      const phone = (body.phone || "").trim();
+      
+      const cfIp = request.headers.get("cf-connecting-ip");
+      const forwardedIp = request.headers.get("x-forwarded-for");
+      const clientIp = body.ip;
+      
+      let userIp = "127.0.0.1";
+      if (clientIp && clientIp !== "Detecting..." && clientIp.trim() !== "") {
+          userIp = clientIp;
+      } else if (cfIp) {
+          userIp = cfIp;
+      } else if (forwardedIp) {
+          userIp = forwardedIp.split(',')[0].trim();
       }
 
-      const clientIp = request.headers.get("cf-connecting-ip") || "Unknown";
-      const country = request.headers.get("cf-ipcountry") || "Unknown";
-      const userAgent = request.headers.get("user-agent") || "Unknown";
+      const userAgent = request.headers.get("user-agent") || "";
+
+      if (!email) {
+        return new Response(JSON.stringify({ success: false, error: "Email required" }), { 
+          status: 400, 
+          headers: { ...corsHeaders, "Content-Type": "application/json" } 
+        });
+      }
+
+      // চেক করব এই ইমেইলের কোনো রেকর্ড আগে থেকেই আছে কি না
+      let existingRecord = await env.retail.prepare(
+        `SELECT * FROM rorraxy_affiliates_master WHERE email = ?`
+      ).bind(email).first();
+
+      let generatedUniqueId = existingRecord?.unique_affiliate_id;
+
+      if (!generatedUniqueId) {
+        const emailPrefix = email.split('@')[0].replace(/[^a-z0-9]/gi, '').substring(0, 7);
+        const randomHash = Math.random().toString(36).substring(2, 8);
+        generatedUniqueId = `${emailPrefix}_${randomHash}_${Date.now().toString(36).slice(-3)}`;
+      }
+
       const now = new Date().toISOString();
-      const authProvider = "email";
-      const authId = email;
 
-      // master টেবিলে ভেরিফিকেশন, আইপি এবং auth_provider/auth_id সেভ করা
       await env.retail.prepare(`
-        INSERT INTO affiliate_info (email, is_verified, auth_provider, auth_id, last_ip, ip_country, user_agent, verified_at, created_at)
-        VALUES (?, 1, ?, ?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM affiliate_info WHERE email = ?), ?))
+        INSERT INTO rorraxy_affiliates_master (
+          unique_affiliate_id, email, country_code, phone, user_ip, user_agent, auth_provider, status, admin_approval, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'email', 'active', 'pending', ?, ?)
         ON CONFLICT(email) DO UPDATE SET
-          is_verified = 1,
-          auth_provider = COALESCE(affiliate_info.auth_provider, excluded.auth_provider),
-          auth_id = COALESCE(affiliate_info.auth_id, excluded.auth_id),
-          last_ip = excluded.last_ip,
-          ip_country = excluded.ip_country,
+          country_code = excluded.country_code,
+          phone = CASE WHEN excluded.phone != '' THEN excluded.phone ELSE rorraxy_affiliates_master.phone END,
+          user_ip = CASE WHEN excluded.user_ip != 'Detecting...' AND excluded.user_ip != '' THEN excluded.user_ip ELSE rorraxy_affiliates_master.user_ip END,
           user_agent = excluded.user_agent,
-          verified_at = excluded.verified_at
-      `).bind(email, authProvider, authId, clientIp, country, userAgent, now, email, now).run();
+          updated_at = excluded.updated_at
+      `).bind(generatedUniqueId, email, countryCode, phone, userIp, userAgent, now, now).run();
 
-      return new Response(JSON.stringify({ success: true, message: "Verified successfully in master table" }), {
+      return new Response(JSON.stringify({ 
+        success: true, 
+        message: "Magic verification code and IP recorded successfully", 
+        unique_affiliate_id: generatedUniqueId,
+        is_existing: !!existingRecord && !!existingRecord.first_name
+      }), {
         status: 200,
         headers: { ...corsHeaders, "Content-Type": "application/json" }
       });
     }
 
     // ==========================================
-    // ২. ইনফো রেজিস্ট্রেশন ও আপডেট (info.html থেকে)
+    // ২. ম্যাজিক কোড ভেরিফিকেশন এন্ডপয়েন্ট (স্মার্ট লগইন রিডাইরেক্ট সহ)
+    // ==========================================
+    if (action === "verify_magic_code" && request.method === "POST") {
+      const body = await request.json();
+      const email = (body.email || "").toLowerCase().trim();
+      
+      const cfIp = request.headers.get("cf-connecting-ip");
+      const forwardedIp = request.headers.get("x-forwarded-for");
+      const clientIp = body.ip;
+      
+      let userIp = "127.0.0.1";
+      if (clientIp && clientIp !== "Detecting..." && clientIp.trim() !== "") {
+          userIp = clientIp;
+      } else if (cfIp) {
+          userIp = cfIp;
+      } else if (forwardedIp) {
+          userIp = forwardedIp.split(',')[0].trim();
+      }
+
+      const now = new Date().toISOString();
+
+      await env.retail.prepare(`
+        UPDATE rorraxy_affiliates_master SET
+          user_ip = ?,
+          updated_at = ?
+        WHERE email = ?
+      `).bind(userIp, now, email).run();
+
+      const record = await env.retail.prepare(
+        `SELECT * FROM rorraxy_affiliates_master WHERE email = ?`
+      ).bind(email).first();
+
+      const isComplete = record && record.first_name && record.first_name.trim() !== "";
+
+      return new Response(JSON.stringify({ 
+        success: true, 
+        message: "Magic code and IP verified", 
+        unique_affiliate_id: record?.unique_affiliate_id,
+        is_complete: !!isComplete,
+        user_data: record || null
+      }), {
+        status: 200,
+        headers: { ...corsHeaders, "Content-Type": "application/json" }
+      });
+    }
+
+    // ==========================================
+    // ৩. প্রোফাইল ইনফো রেজিস্টার ও আপডেট
     // ==========================================
     if (action === "register" && request.method === "POST") {
       const data = await request.json();
-      const email = (data.email || "").toLowerCase();
-      const clientIp = request.headers.get("cf-connecting-ip") || "Unknown";
-      const country = request.headers.get("cf-ipcountry") || "Unknown";
-      const userAgent = request.headers.get("user-agent") || "Unknown";
+      const email = (data.email || "").toLowerCase().trim();
       const now = new Date().toISOString();
-      const authProvider = data.auth_provider || "email";
-      const authId = data.auth_id || email;
 
       if (!email) {
-        return new Response(JSON.stringify({ success: false, error: "Email required" }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+        return new Response(JSON.stringify({ success: false, error: "Email required" }), { 
+          status: 400, 
+          headers: { ...corsHeaders, "Content-Type": "application/json" } 
+        });
       }
 
       await env.retail.prepare(`
-        INSERT INTO affiliate_info (
-          email, first_name, last_name, phone, promo_channel, payment_method, account_details, 
-          auth_provider, auth_id, is_verified, last_ip, ip_country, user_agent, verified_at, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, COALESCE((SELECT created_at FROM affiliate_info WHERE email = ?), ?))
-        ON CONFLICT(email) DO UPDATE SET
-          first_name = excluded.first_name,
-          last_name = excluded.last_name,
-          phone = excluded.phone,
-          promo_channel = excluded.promo_channel,
-          payment_method = excluded.payment_method,
-          account_details = excluded.account_details,
-          auth_provider = excluded.auth_provider,
-          auth_id = excluded.auth_id,
-          last_ip = excluded.last_ip,
-          ip_country = excluded.ip_country,
-          user_agent = excluded.user_agent,
-          verified_at = COALESCE(affiliate_info.verified_at, excluded.verified_at)
+        UPDATE rorraxy_affiliates_master SET
+          first_name = ?,
+          last_name = ?,
+          country_code = COALESCE(NULLIF(?, ''), country_code),
+          phone = ?,
+          promo_channel = ?,
+          payment_method = ?,
+          account_details = ?,
+          updated_at = ?
+        WHERE email = ?
       `).bind(
-        email,
         data.first_name || "",
         data.last_name || "",
+        data.country_code || "",
         data.phone || "",
         data.promo_channel || "",
         data.payment_method || "",
         data.account_details || "",
-        authProvider,
-        authId,
-        clientIp,
-        country,
-        userAgent,
         now,
-        email,
-        now
+        email
       ).run();
 
-      return new Response(JSON.stringify({ success: true, message: "Affiliate info saved successfully" }), {
+      return new Response(JSON.stringify({ success: true, message: "Affiliate info updated successfully" }), {
         status: 200,
         headers: { ...corsHeaders, "Content-Type": "application/json" }
       });
     }
 
     // ==========================================
-    // ৩. প্রোফাইল ডাটা ফেচ (GET)
+    // ৪. প্রোফাইল ডাটা ফেচ (GET)
     // ==========================================
     if (action === "info" && request.method === "GET") {
       const affiliateId = url.searchParams.get("affiliate_id");
       if (!affiliateId) {
-        return new Response(JSON.stringify({ success: false, error: "Affiliate ID required" }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+        return new Response(JSON.stringify({ success: false, error: "Affiliate ID required" }), { 
+          status: 400, 
+          headers: { ...corsHeaders, "Content-Type": "application/json" } 
+        });
       }
 
-      const info = await env.retail.prepare(`SELECT * FROM affiliate_info WHERE email = ?`).bind(affiliateId.toLowerCase()).all();
+      const queryParam = affiliateId.toLowerCase().trim();
+      const info = await env.retail.prepare(`
+        SELECT * FROM rorraxy_affiliates_master 
+        WHERE email = ? OR unique_affiliate_id = ?
+      `).bind(queryParam, queryParam).all();
+
       return new Response(JSON.stringify({ success: true, data: info.results }), {
         status: 200,
         headers: { ...corsHeaders, "Content-Type": "application/json" }
@@ -132,113 +207,63 @@ export async function onRequest(context) {
     }
 
     // ==========================================
-    // ৪. কনভার্শন এবং ক্লিক লগ (reports.html ও links.html)
-    // ==========================================
-    if (action === "conversion") {
-      if (request.method === "POST") {
-        const data = await request.json();
-        const affiliateId = (data.affiliate_id || "").toLowerCase();
-        const now = new Date().toISOString();
-
-        await env.retail.prepare(`
-          INSERT INTO affiliate_conversions (affiliate_id, order_id, platform_name, commission_amount, status, created_at)
-          VALUES (?, ?, ?, ?, 'PENDING', ?)
-        `).bind(
-          affiliateId,
-          data.order_id || `LINK_${Date.now()}`,
-          data.platform_name || 'Retail Store',
-          data.commission_amount || 0.00,
-          now
-        ).run();
-
-        return new Response(JSON.stringify({ success: true, message: "Conversion logged successfully" }), {
-          status: 200,
-          headers: { ...corsHeaders, "Content-Type": "application/json" }
-        });
-      }
-
-      if (request.method === "GET") {
-        const affiliateId = url.searchParams.get("affiliate_id");
-        const conversions = await env.retail.prepare(`SELECT * FROM affiliate_conversions WHERE affiliate_id = ? ORDER BY id DESC`).bind((affiliateId || "").toLowerCase()).all();
-        
-        return new Response(JSON.stringify({ success: true, data: conversions.results }), {
-          status: 200,
-          headers: { ...corsHeaders, "Content-Type": "application/json" }
-        });
-      }
-    }
-
-    // ==========================================
-    // ৫. পেআউট রিকোয়েস্ট এবং হিস্ট্রি (payout.html)
-    // ==========================================
-    if (action === "payout" || action === "payout_request") {
-      if (request.method === "POST") {
-        const data = await request.json();
-        const affiliateId = (data.affiliate_id || "").toLowerCase();
-        const now = new Date().toISOString();
-
-        await env.retail.prepare(`
-          INSERT INTO affiliate_payouts (affiliate_id, payment_method, amount, status, request_date)
-          VALUES (?, ?, ?, 'PENDING', ?)
-        `).bind(
-          affiliateId,
-          data.payment_method || 'bKash',
-          data.amount || 0.00,
-          now
-        ).run();
-
-        return new Response(JSON.stringify({ success: true, message: "Payout request submitted" }), {
-          status: 200,
-          headers: { ...corsHeaders, "Content-Type": "application/json" }
-        });
-      }
-
-      if (request.method === "GET") {
-        const affiliateId = url.searchParams.get("affiliate_id");
-        const payouts = await env.retail.prepare(`SELECT * FROM affiliate_payouts WHERE affiliate_id = ? ORDER BY id DESC`).bind((affiliateId || "").toLowerCase()).all();
-        
-        return new Response(JSON.stringify({ success: true, data: payouts.results }), {
-          status: 200,
-          headers: { ...corsHeaders, "Content-Type": "application/json" }
-        });
-      }
-    }
-
-    // ==========================================
-    // ৬. ড্যাশবোর্ড স্ট্যাটস বা সামারি (dashboard.html)
+    // ৫. ড্যাশবোর্ড স্ট্যাটস
     // ==========================================
     if (action === "stats" && request.method === "GET") {
-      const affiliateId = (url.searchParams.get("affiliate_id") || "").toLowerCase();
+      const affiliateId = (url.searchParams.get("affiliate_id") || "").toLowerCase().trim();
 
-      const commRes = await env.retail.prepare(`
-        SELECT SUM(commission_amount) as total_earnings 
-        FROM affiliate_conversions 
-        WHERE affiliate_id = ? AND status IN ('CONFIRMED', 'PAID')
-      `).bind(affiliateId).first();
+      const stats = await env.retail.prepare(`
+        SELECT 
+          unique_affiliate_id,
+          total_earnings, 
+          available_balance, 
+          total_clicks, 
+          total_referrals,
+          status,
+          admin_approval,
+          payout_status
+        FROM rorraxy_affiliates_master 
+        WHERE email = ? OR unique_affiliate_id = ?
+      `).bind(affiliateId, affiliateId).all();
 
-      const clickRes = await env.retail.prepare(`
-        SELECT COUNT(*) as total_clicks 
-        FROM affiliate_conversions 
-        WHERE affiliate_id = ?
-      `).bind(affiliateId).first();
-
-      const totalEarnings = commRes?.total_earnings || 0.00;
-      const totalClicks = clickRes?.total_clicks || 0;
-
-      const statsData = [{
-        total_earnings: totalEarnings,
-        available_balance: totalEarnings,
-        total_clicks: totalClicks,
-        total_referrals: totalClicks
-      }];
-
-      return new Response(JSON.stringify({ success: true, data: statsData }), {
+      return new Response(JSON.stringify({ success: true, data: stats.results }), {
         status: 200,
         headers: { ...corsHeaders, "Content-Type": "application/json" }
       });
     }
 
-    return new Response(JSON.stringify({ message: "Affiliate Master API Active" }), { status: 200, headers: corsHeaders });
+    // ==========================================
+    // ৬. পেআউট রিকোয়েস্ট
+    // ==========================================
+    if (action === "payout" || action === "payout_request") {
+      if (request.method === "POST") {
+        const data = await request.json();
+        const affiliateId = (data.affiliate_id || "").toLowerCase().trim();
+        const requestedAmount = parseFloat(data.amount || 0.00);
+        const now = new Date().toISOString();
+
+        await env.retail.prepare(`
+          UPDATE rorraxy_affiliates_master SET
+            available_balance = CASE 
+              WHEN available_balance >= ? THEN available_balance - ? 
+              ELSE available_balance 
+            END,
+            payout_status = 'pending',
+            updated_at = ?
+          WHERE (email = ? OR unique_affiliate_id = ?) AND available_balance >= ?
+        `).bind(requestedAmount, requestedAmount, now, affiliateId, affiliateId, requestedAmount).run();
+
+        return new Response(JSON.stringify({ success: true, message: "Payout request logged successfully" }), {
+          status: 200,
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
+    }
+
+    return new Response(JSON.stringify({ message: "rorraxy Master Affiliate API Active" }), { 
+      status: 200, 
+      headers: corsHeaders 
+    });
 
   } catch (err) {
     return new Response(JSON.stringify({ success: false, error: err.message }), {
