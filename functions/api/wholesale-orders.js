@@ -2,13 +2,22 @@ export async function onRequestPost(context) {
     const corsHeaders = {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
         "Content-Type": "application/json"
     };
 
     try {
         const { request, env } = context;
-        const data = await request.json();
+        
+        let data;
+        try {
+            data = await request.json();
+        } catch (e) {
+            return new Response(JSON.stringify({ success: false, error: "Invalid JSON body format" }), {
+                status: 400,
+                headers: corsHeaders
+            });
+        }
 
         const {
             master_order_id,
@@ -30,7 +39,7 @@ export async function onRequestPost(context) {
         } = data;
 
         if (!master_order_id || !customer_name || !customer_phone || !shipping_address || !items || !Array.isArray(items)) {
-            return new Response(JSON.stringify({ success: false, error: "Missing required wholesale order fields" }), {
+            return new Response(JSON.stringify({ success: false, error: "Missing required wholesale order fields or items array" }), {
                 status: 400,
                 headers: corsHeaders
             });
@@ -48,6 +57,10 @@ export async function onRequestPost(context) {
         const insertedSubOrders = [];
         const db = env.retail; // আপনার D1 ডাটাবেস বাইন্ডিং
 
+        if (!db) {
+            throw new Error("Database binding 'retail' not found in environment variables.");
+        }
+
         for (const [sellerId, sellerItems] of Object.entries(sellerGroups)) {
             const subOrderId = master_order_id + '-WS-' + sellerId.substring(0, 6).toUpperCase() + '-' + Math.floor(100 + Math.random() * 900);
 
@@ -58,6 +71,7 @@ export async function onRequestPost(context) {
                 subOrderTotal += (price * qty);
             });
 
+            // মোট ১৮টি কলামের জন্য ঠিক ১৮টি প্রশ্নবোধক চিহ্ন (?) রাখা হয়েছে
             const query = `
                 INSERT INTO wholesale_orders (
                     master_order_id, sub_order_id, seller_id, buyer_company_name, customer_name, customer_phone, 
@@ -121,7 +135,7 @@ export async function onRequestOptions() {
         headers: {
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type"
+            "Access-Control-Allow-Headers": "Content-Type, Authorization"
         }
     });
 }
