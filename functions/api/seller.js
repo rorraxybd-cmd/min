@@ -12,98 +12,153 @@ export async function onRequest(context) {
     return new Response(null, { headers: corsHeaders });
   }
 
-  // অটো-ডিটেক্ট D1 ডাটাবেজ বাইন্ডিং (retail অথবা DB)
   const db = env.retail || env.DB;
   if (!db) {
-    return new Response(JSON.stringify({ success: false, error: "Database binding not found in environment (env.retail or env.DB)" }), {
-      status: 500,
-      headers: { ...corsHeaders, "Content-Type": "application/json" }
-    });
+    return new Response(
+      JSON.stringify({ success: false, error: "Database binding not found" }),
+      {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      }
+    );
   }
 
   try {
-    // ১. ম্যাজিক লিংক জেনারেট রিকোয়েস্ট
-    if (url.pathname.includes("/send-magic-link")) {
+    const pathname = url.pathname;
+
+    // 1. Send Magic Link & Check Existing Profile Status
+    if (pathname.includes("/send-magic-link")) {
       if (request.method !== "POST") {
-        return new Response(JSON.stringify({ error: "Method not allowed" }), { status: 405, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+        return new Response(
+          JSON.stringify({ error: "Method not allowed" }),
+          {
+            status: 405,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
       }
 
-      const { email } = await request.json();
+      const bodyData = await request.json().catch(() => ({}));
+      const email = (bodyData.email || "").toLowerCase().trim();
+      const mobile_number = bodyData.mobile_number || "";
+
       if (!email) {
-        return new Response(JSON.stringify({ error: "Email required" }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+        return new Response(
+          JSON.stringify({ error: "Email required" }),
+          {
+            status: 400,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
       }
+
+      // Check if seller already exists and has completed profile info
+      const existingSeller = await db.prepare("SELECT * FROM sellers WHERE email = ?").bind(email).first();
+      
+      const emailPrefix = email.split('@')[0].replace(/[^a-z0-9]/g, '').substring(0, 6);
+      const randomSuffix = Math.random().toString(36).substring(2, 8);
+      const uniqueSellerId = existingSeller?.seller_id || `rorraxy-${emailPrefix}-${randomSuffix}`;
 
       const token = crypto.randomUUID();
-      const expiresAt = Date.now() + 180 * 1000;
+      const expiresAt = Date.now() + 300 * 1000; // 5 minutes expiration
+      const clientIp = request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for") || "Unknown";
+      const ipCountry = request.headers.get("cf-ipcountry") || "BD";
+      const userAgent = request.headers.get("user-agent") || "Unknown";
 
-      await db.prepare(`
-        INSERT INTO verification_tokens (token, email, expires_at)
-        VALUES (?, ?, ?)
-      `).bind(token, email.toLowerCase(), expiresAt).run();
+      const sqlMagic = `
+        INSERT INTO sellers (
+          seller_id, email, mobile_number, verification_token, token_expires_at, last_ip, ip_country, user_agent, is_verified
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+        ON CONFLICT(email) DO UPDATE SET 
+          verification_token = excluded.verification_token, 
+          token_expires_at = excluded.token_expires_at, 
+          mobile_number = COALESCE(NULLIF(excluded.mobile_number, ''), sellers.mobile_number),
+          last_ip = excluded.last_ip,
+          ip_country = excluded.ip_country,
+          user_agent = excluded.user_agent
+      `;
+
+      await db.prepare(sqlMagic).bind(uniqueSellerId, email, mobile_number, token, expiresAt, clientIp, ipCountry, userAgent).run();
 
       const magicLink = `https://${url.hostname}/api/seller/verify-magic?token=${token}`;
 
-      return new Response(JSON.stringify({ success: true, magicLink }), {
-        status: 200,
-        headers: { ...corsHeaders, "Content-Type": "application/json" }
-      });
+      // If profile is already complete (e.g. brand_name exists), we can signal a direct dashboard bypass flag
+      const isProfileComplete = existingSeller && existingSeller.brand_name && existingSeller.full_name ? true : false;
+
+      return new Response(
+        JSON.stringify({ 
+          success: true, 
+          message: "Verification token generated successfully", 
+          magicLink: magicLink,
+          seller_id: uniqueSellerId,
+          isProfileComplete: isProfileComplete
+        }),
+        {
+          status: 200,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        }
+      );
     }
 
-    // ২. ম্যাজিক লিংক ভেরিফিকেশন ও সিকিউরিটি লগ
-    if (url.pathname.includes("/verify-magic")) {
+    // 2. Verify Magic Link Token Endpoint & Smart Redirect
+    if (pathname.includes("/verify-magic")) {
       const token = url.searchParams.get("token");
-      if (!token) return new Response("Invalid Token", { status: 400 });
-
-      const record = await db.prepare(`
-        SELECT * FROM verification_tokens WHERE token = ?
-      `).bind(token).first();
-
-      if (!record || Date.now() > record.expires_at) {
-        return new Response("Link expired or invalid!", { status: 410 });
+      if (!token) {
+        return new Response("Invalid Verification Token", { status: 400 });
       }
 
-      const email = record.email;
-      const clientIp = request.headers.get("cf-connecting-ip") || "Unknown";
-      const country = request.headers.get("cf-ipcountry") || "Unknown";
-      const userAgent = request.headers.get("user-agent") || "Unknown";
+      const sqlCheck = "SELECT * FROM sellers WHERE verification_token = ?";
+      const record = await db.prepare(sqlCheck).bind(token).first();
+
+      if (!record || Date.now() > record.token_expires_at) {
+        return new Response("Verification link has expired or is invalid!", { status: 410 });
+      }
+
       const now = new Date().toISOString();
+      const sqlVerify = "UPDATE sellers SET is_verified = 1, verified_at = ?, verification_token = NULL, token_expires_at = NULL WHERE verification_token = ?";
 
-      await db.prepare(`
-        INSERT INTO sellers (email, is_verified, last_ip, ip_country, user_agent, verified_at, created_at)
-        VALUES (?, 1, ?, ?, ?, ?, COALESCE((SELECT created_at FROM sellers WHERE email = ?), ?))
-        ON CONFLICT(email) DO UPDATE SET
-          is_verified = 1,
-          last_ip = excluded.last_ip,
-          ip_country = excluded.ip_country,
-          user_agent = excluded.user_agent,
-          verified_at = excluded.verified_at
-      `).bind(email, clientIp, country, userAgent, now, email, now).run();
+      await db.prepare(sqlVerify).bind(now, token).run();
 
-      await db.prepare(`DELETE FROM verification_tokens WHERE token = ?`).bind(token).run();
-
-      // ভেরিফিকেশনের পর সরাসরি ড্যাশবোর্ডে রিডাইরেক্ট
-      return Response.redirect(`https://${url.hostname}/seller/dashboard.html?verified=true`, 302);
+      // Check if user profile is already fully filled out. If yes, send directly to dashboard tab/view.
+      const isComplete = record.brand_name && record.full_name ? "true" : "false";
+      const redirectUrl = `https://${url.hostname}/seller/index.html?verified=true&email=${encodeURIComponent(record.email)}&complete=${isComplete}`;
+      
+      return Response.redirect(redirectUrl, 302);
     }
 
-    // ৩. সেলার প্রোফাইল ডাটা সেভ (POST) - সাথে সেলারের মূল ID রিটার্ন করার ব্যবস্থা
+    // 3. POST Upsert / Save Seller Profile Information
     if (request.method === "POST") {
-      const data = await request.json();
-      const email = (data.email || data.seller_id || "").toLowerCase();
+      const data = await request.json().catch(() => ({}));
+      const email = (data.email || data.seller_id || "").toLowerCase().trim();
+      const mobileNumber = data.mobile_number || data.phone || "";
       const clientIp = request.headers.get("cf-connecting-ip") || "Unknown";
-      const country = request.headers.get("cf-ipcountry") || data.country || "Unknown";
+      const country = request.headers.get("cf-ipcountry") || data.country || "Bangladesh";
       const userAgent = request.headers.get("user-agent") || "Unknown";
       const now = new Date().toISOString();
 
       if (!email) {
-        return new Response(JSON.stringify({ success: false, error: "Email required" }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+        return new Response(
+          JSON.stringify({ success: false, error: "Email required" }),
+          {
+            status: 400,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
       }
 
-      await db.prepare(`
+      const emailPrefix = email.split('@')[0].replace(/[^a-z0-9]/g, '').substring(0, 6);
+      const fallbackSellerId = `rorraxy-${emailPrefix}-${Math.random().toString(36).substring(2, 8)}`;
+      const finalSellerId = data.seller_id && data.seller_id.startsWith('rorraxy-') ? data.seller_id : fallbackSellerId;
+
+      const sqlUpsert = `
         INSERT INTO sellers (
-          email, brand_name, full_name, business_desc, whatsapp, 
-          emergency_phone, country, full_address, doc_type, doc_number, trade_license, logo_url, is_verified, last_ip, ip_country, user_agent, verified_at, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, COALESCE((SELECT created_at FROM sellers WHERE email = ?), ?))
-        ON CONFLICT(email) DO UPDATE SET
+          seller_id, email, mobile_number, brand_name, full_name, business_desc, 
+          whatsapp, emergency_phone, country, full_address, doc_type, doc_number, 
+          trade_license, logo_url, is_verified, admin_approval_status, last_ip, ip_country, user_agent, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending', ?, ?, ?, COALESCE((SELECT created_at FROM sellers WHERE email = ?), ?)) 
+        ON CONFLICT(email) DO UPDATE SET 
+          seller_id = COALESCE(NULLIF(sellers.seller_id, ''), excluded.seller_id),
+          mobile_number = COALESCE(NULLIF(excluded.mobile_number, ''), sellers.mobile_number),
           brand_name = excluded.brand_name,
           full_name = excluded.full_name,
           business_desc = excluded.business_desc,
@@ -117,64 +172,83 @@ export async function onRequest(context) {
           logo_url = excluded.logo_url,
           last_ip = excluded.last_ip,
           ip_country = excluded.ip_country,
-          user_agent = excluded.user_agent,
-          verified_at = COALESCE(sellers.verified_at, excluded.verified_at)
-      `).bind(
+          user_agent = excluded.user_agent
+      `;
+
+      await db.prepare(sqlUpsert).bind(
+        finalSellerId,
         email,
+        mobileNumber,
         data.brand_name || "",
         data.full_name || "",
         data.business_desc || "",
         data.whatsapp || "",
         data.emergency_phone || "",
-        data.country || "Bangladesh",
+        country,
         data.full_address || "",
         data.doc_type || "NID",
         data.doc_number || "",
-        data.trade_license || data.default_payout_details || "",
+        data.trade_license || "N/A",
         data.logo_url || "",
         clientIp,
         country,
         userAgent,
-        now,
         email,
         now
       ).run();
 
-      // সেভ হওয়ার পর ওই সেলারের ইউনিক ID সহ রেকর্ড ফেচ করে নেওয়া
-      const sellerRecord = await db.prepare(`SELECT id, email FROM sellers WHERE email = ?`).bind(email).first();
+      const sellerRecord = await db.prepare("SELECT id, seller_id, email FROM sellers WHERE email = ?").bind(email).first();
 
-      return new Response(JSON.stringify({ 
-        success: true, 
-        message: "Seller profile and security logs saved successfully to D1", 
-        seller_id: sellerRecord ? sellerRecord.id : null,
-        email: email 
-      }), {
-        status: 200,
-        headers: { ...corsHeaders, "Content-Type": "application/json" }
-      });
+      return new Response(
+        JSON.stringify({
+          success: true,
+          message: "Seller data saved successfully",
+          seller_id: sellerRecord ? sellerRecord.seller_id : finalSellerId,
+          email: email,
+        }),
+        {
+          status: 200,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        }
+      );
     }
 
-    // ৪. সেলার প্রোফাইল ডাটা ফেচ (GET)
+    // 4. GET Seller Profile
     if (request.method === "GET") {
       const email = url.searchParams.get("email");
       if (!email) {
-        return new Response(JSON.stringify({ success: false, error: "Email parameter required" }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+        return new Response(
+          JSON.stringify({ success: false, error: "Email parameter required" }),
+          {
+            status: 400,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
       }
 
-      const seller = await db.prepare(`SELECT * FROM sellers WHERE email = ?`).bind(email.toLowerCase()).all();
+      const sqlFetch = "SELECT * FROM sellers WHERE email = ?";
+      const seller = await db.prepare(sqlFetch).bind(email.toLowerCase()).all();
 
-      return new Response(JSON.stringify({ success: true, data: seller.results }), {
-        status: 200,
-        headers: { ...corsHeaders, "Content-Type": "application/json" }
-      });
+      return new Response(
+        JSON.stringify({ success: true, data: seller.results }),
+        {
+          status: 200,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        }
+      );
     }
 
-    return new Response(JSON.stringify({ message: "Seller Pages Function Active" }), { status: 200, headers: corsHeaders });
-
+    return new Response(
+      JSON.stringify({ message: "Seller API Active" }),
+      { status: 200, headers: corsHeaders }
+    );
   } catch (err) {
-    return new Response(JSON.stringify({ success: false, error: err.message }), {
-      status: 500,
-      headers: { ...corsHeaders, "Content-Type": "application/json" }
-    });
+    return new Response(
+      JSON.stringify({ success: false, error: err.message }),
+      {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      }
+    );
   }
 }
