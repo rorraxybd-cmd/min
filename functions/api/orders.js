@@ -2,13 +2,23 @@ export async function onRequestPost(context) {
     const corsHeaders = {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
         "Content-Type": "application/json"
     };
 
     try {
         const { request, env } = context;
-        const data = await request.json();
+        
+        // রিকোয়েস্ট বডি পার্স করার সময় সেফটি ট্রাই-ক্যাচ
+        let data;
+        try {
+            data = await request.json();
+        } catch (e) {
+            return new Response(JSON.stringify({ success: false, error: "Invalid JSON body format" }), {
+                status: 400,
+                headers: corsHeaders
+            });
+        }
 
         const {
             master_order_id,
@@ -30,7 +40,7 @@ export async function onRequestPost(context) {
 
         // রিটেইল অর্ডার ভ্যালিডেশন
         if (!master_order_id || !customer_name || !customer_phone || !shipping_address || !items || !Array.isArray(items)) {
-            return new Response(JSON.stringify({ success: false, error: "Missing required retail order fields or items" }), {
+            return new Response(JSON.stringify({ success: false, error: "Missing required retail order fields or items array" }), {
                 status: 400,
                 headers: corsHeaders
             });
@@ -47,12 +57,16 @@ export async function onRequestPost(context) {
         });
 
         const insertedSubOrders = [];
-        const db = env.retail; // আপনার D1 ডাটাবেস বাইন্ডিং
+        const db = env.retail; // আপনার D1 ডাটাবেস বাইন্ডিং (wrangler.toml এ binding = "retail" থাকতে হবে)
+
+        if (!db) {
+            throw new Error("Database binding 'retail' not found in environment variables.");
+        }
 
         // প্রতিটি সেলারের জন্য আলাদা সাব-অর্ডার ও সেলার আইডি দিয়ে ডাটাবেসে ইনসার্ট করা
         for (const [sellerId, sellerItems] of Object.entries(sellerGroups)) {
             
-            // সাব-অর্ডার আইডি এবং সেলার আইডি জেনারেশন
+            // সাব-অর্ডার আইডি জেনারেশন
             const subOrderId = master_order_id + '-' + sellerId.substring(0, 6).toUpperCase() + '-' + Math.floor(100 + Math.random() * 900);
 
             // এই সেলারের আইটেমগুলোর মোট দাম হিসাব করা
@@ -63,7 +77,6 @@ export async function onRequestPost(context) {
                 subOrderTotal += (price * qty);
             });
 
-            // এফিলিয়েট ও এডমিন কমিশন ক্যালকুলেশন (প্রয়োজন অনুযায়ী অ্যাডজাস্ট করা যাবে)
             const calculatedAffiliateComm = Number(affiliate_commission || 0);
             const calculatedAdminComm = Number(admin_commission || 0);
 
@@ -129,7 +142,7 @@ export async function onRequestOptions() {
         headers: {
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type"
+            "Access-Control-Allow-Headers": "Content-Type, Authorization"
         }
     });
 }
