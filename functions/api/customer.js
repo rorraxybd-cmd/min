@@ -26,9 +26,6 @@ export async function onRequest(context) {
     const clientIp = request.headers.get("cf-connecting-ip") || "Unknown";
     const userAgent = request.headers.get("user-agent") || "Unknown";
 
-    // ==========================================
-    // ১. ওটিপি পাঠানো এবং লগ সেভ করা
-    // ==========================================
     if (action === "send-otp") {
       const phone = body.phone;
       const countryCode = body.country_code || "";
@@ -40,14 +37,11 @@ export async function onRequest(context) {
         });
       }
 
-      // ৬ ডিজিটের র্যান্ডম ওটিপি কোড জেনারেট
       const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
 
-      // ডাটাবেজে লগ সংরক্ষণ
-      await env.retail.prepare(`
-        INSERT INTO customer_auth_logs (phone, country_code, ip_address, device_info, auth_token, status, last_login)
-        VALUES (?, ?, ?, ?, ?, 'Pending', CURRENT_TIMESTAMP)
-      `).bind(phone, countryCode, clientIp, body.device_info || userAgent, otpCode).run();
+      await env.retail.prepare(
+        "INSERT INTO customer_auth_logs (phone, country_code, ip_address, device_info, auth_token, status, last_login) VALUES (?, ?, ?, ?, ?, 'Pending', CURRENT_TIMESTAMP)"
+      ).bind(phone, countryCode, clientIp, body.device_info || userAgent, otpCode).run();
 
       return new Response(JSON.stringify({ 
         success: true, 
@@ -59,9 +53,6 @@ export async function onRequest(context) {
       });
     }
 
-    // ==========================================
-    // ২. ওটিপি ভেরিফাই এবং এক্সেস গ্র্যান্ট
-    // ==========================================
     if (action === "verify-otp") {
       const phone = body.phone;
       const otp = body.otp;
@@ -73,11 +64,9 @@ export async function onRequest(context) {
         });
       }
 
-      const record = await env.retail.prepare(`
-        SELECT * FROM customer_auth_logs 
-        WHERE phone = ? AND auth_token = ? 
-        ORDER BY id DESC LIMIT 1
-      `).bind(phone, otp).first();
+      const record = await env.retail.prepare(
+        "SELECT * FROM customer_auth_logs WHERE phone = ? AND auth_token = ? ORDER BY id DESC LIMIT 1"
+      ).bind(phone, otp).first();
 
       if (!record) {
         return new Response(JSON.stringify({ success: false, error: "Invalid OTP code." }), {
@@ -86,9 +75,9 @@ export async function onRequest(context) {
         });
       }
 
-      await env.retail.prepare(`
-        UPDATE customer_auth_logs SET status = 'Verified', last_login = CURRENT_TIMESTAMP WHERE id = ?
-      `).bind(record.id).run();
+      await env.retail.prepare(
+        "UPDATE customer_auth_logs SET status = 'Verified', last_login = CURRENT_TIMESTAMP WHERE id = ?"
+      ).bind(record.id).run();
 
       const authToken = "rorraxy_cust_" + Math.random().toString(36).substring(2) + Date.now();
 
@@ -102,15 +91,11 @@ export async function onRequest(context) {
       });
     }
 
-    // ==========================================
-    // ৩. চেকআউট থেকে কাস্টমার ইনফো ও অর্ডার সিংক (Customer Auth Sync)
-    // ==========================================
     if (action === "sync-customer") {
       const phone = body.phone;
       const customerName = body.customer_name || "";
       const shippingAddress = body.shipping_address || "";
       const masterOrderId = body.master_order_id || "";
-      const orderId = body.order_id || "";
 
       if (!phone) {
         return new Response(JSON.stringify({ success: false, error: "Phone number is required for sync." }), {
@@ -119,11 +104,9 @@ export async function onRequest(context) {
         });
       }
 
-      // ডাটাবেজে কাস্টমার রেকর্ড আপডেট বা ইনসার্ট করা
-      await env.retail.prepare(`
-        INSERT INTO customer_auth_logs (phone, ip_address, device_info, customer_name, shipping_address, master_order_id, auth_token, status, last_login)
-        VALUES (?, ?, ?, ?, ?, ?, 'SYNCED_TOKEN', 'Verified', CURRENT_TIMESTAMP)
-      `).bind(phone, clientIp, userAgent, customerName, shippingAddress, masterOrderId).run();
+      await env.retail.prepare(
+        "INSERT INTO customer_auth_logs (phone, ip_address, device_info, customer_name, shipping_address, master_order_id, auth_token, status, last_login) VALUES (?, ?, ?, ?, ?, ?, 'SYNCED_TOKEN', 'Verified', CURRENT_TIMESTAMP)"
+      ).bind(phone, clientIp, userAgent, customerName, shippingAddress, masterOrderId).run();
 
       return new Response(JSON.stringify({ 
         success: true, 
@@ -145,4 +128,4 @@ export async function onRequest(context) {
       headers: { ...corsHeaders, "Content-Type": "application/json" }
     });
   }
-}[cite: 11]
+}
