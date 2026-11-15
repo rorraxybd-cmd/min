@@ -63,7 +63,6 @@ export async function onRequest(context) {
           headers: { ...corsHeaders, "Content-Type": "application/json" }
         });
       }
-
       const record = await env.retail.prepare(
         "SELECT * FROM customer_auth_logs WHERE phone = ? AND auth_token = ? ORDER BY id DESC LIMIT 1"
       ).bind(phone, otp).first();
@@ -103,11 +102,9 @@ export async function onRequest(context) {
           headers: { ...corsHeaders, "Content-Type": "application/json" }
         });
       }
-
       await env.retail.prepare(
         "INSERT INTO customer_auth_logs (phone, ip_address, device_info, customer_name, shipping_address, master_order_id, auth_token, status, last_login) VALUES (?, ?, ?, ?, ?, ?, 'SYNCED_TOKEN', 'Verified', CURRENT_TIMESTAMP)"
       ).bind(phone, clientIp, userAgent, customerName, shippingAddress, masterOrderId).run();
-
       return new Response(JSON.stringify({ 
         success: true, 
         message: "Customer account and order data synced successfully." 
@@ -116,12 +113,10 @@ export async function onRequest(context) {
         headers: { ...corsHeaders, "Content-Type": "application/json" }
       });
     }
-
     return new Response(JSON.stringify({ success: false, error: "Invalid action endpoint" }), {
       status: 404,
       headers: { ...corsHeaders, "Content-Type": "application/json" }
     });
-
   } catch (err) {
     return new Response(JSON.stringify({ success: false, error: err.message }), {
       status: 500,
